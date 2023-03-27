@@ -1,16 +1,27 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional, TYPE_CHECKING
 
 import aiohttp
-
-from pybotters_wrapper.core.api import FetchOrdersResponse
+import requests
+from yarl import URL
 
 if TYPE_CHECKING:
-    from pybotters_wrapper._typedefs import Side
+    from pybotters_wrapper._typedefs import Side, RequsetMethod
 
 from pybotters_wrapper.core import API
-from pybotters_wrapper.core.store import OrderItem
+from pybotters_wrapper.core.api import (
+    FetchTickerResponse,
+    FetchOrderbookResponse,
+    FetchOrdersResponse,
+    FetchPositionsResponse,
+)
+from pybotters_wrapper.core.store import (
+    TickerItem,
+    OrderbookItem,
+    OrderItem,
+    PositionItem,
+)
 from pybotters_wrapper.utils.mixins import (
     BinanceCOINMMixin,
     BinanceCOINMTESTMixin,
@@ -91,30 +102,49 @@ class BinanceAPIBase(API):
     ) -> dict:
         return {"symbol": symbol.upper(), "orderId": order_id}
 
-    def _make_fetch_orders_parameter(self, symbol: str) -> Optional[dict]:
+    def _make_fetch_ticker_parameter(self, symbol: str) -> dict:
         return {"symbol": symbol}
 
-    def _make_fetch_orders_response(
-        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
-    ) -> FetchOrdersResponse:
-        orders = [
-            OrderItem(
-                id=str(i["orderId"]),
-                symbol=i["symbol"],
-                side=i["side"],
-                price=float(i["price"]),
-                size=float(i["origQty"]) - float(i["executedQty"]),
-                type=i["type"],
-                info=i  # noqa
+    def _make_fetch_orderbook_parameter(self, symbol: str) -> dict:
+        return {"symbol": symbol}
 
-            ) for i in resp_data
+    def _make_fetch_ticker_response(
+        self, resp: aiohttp.ClientResponse, resp_data: dict
+    ) -> FetchTickerResponse:
+        return FetchTickerResponse(
+            TickerItem(
+                symbol=resp_data["symbol"],
+                price=float(resp_data["price"]),
+                info=resp_data,  # noqa
+            ),
+            resp,
+            resp_data,
+        )
+
+    def _make_fetch_orderbook_response(
+        self, resp: aiohttp.ClientResponse, resp_data: dict
+    ) -> "FetchOrderbookResponse":
+        symbol = resp.request_info.url.query["symbol"]
+        asks = [
+            OrderbookItem(
+                symbol=symbol, side="SELL", price=float(i[0]), size=float(i[1])
+            )
+            for i in resp_data["asks"]
         ]
-        return FetchOrdersResponse(orders, resp, resp_data)
+        bids = [
+            OrderbookItem(
+                symbol=symbol, side="BUY", price=float(i[0]), size=float(i[1])
+            )
+            for i in resp_data["bids"]
+        ]
+        return FetchOrderbookResponse({"SELL": asks, "BUY": bids}, resp, resp_data)
 
 
 class BinanceSpotAPI(BinanceSpotMixin, BinanceAPIBase):
     BASE_URL = "https://api.binance.com"
     _ORDER_ENDPOINT = "/api/v3/order"
+    _FETCH_TICKER_ENDPOINT = "/api/v3/ticker/price"
+    _FETCH_ORDERBOOK_ENDPOINT = "/api/v3/depth"
     _FETCH_ORDERS_ENDPOINT = "/api/v3/openOrders"
 
     # binance spotのpublic endpointはauthを付与するとエラーとなる問題の対応
@@ -137,6 +167,32 @@ class BinanceSpotAPI(BinanceSpotMixin, BinanceAPIBase):
             "ticker",
         ]
     }
+
+    async def request(
+        self,
+        method: RequsetMethod,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        **kwargs,
+    ):
+        if URL(url).path in self._PUBLIC_ENDPOINTS:
+            kwargs["auth"] = None
+        return await super().request(method, url, params=params, data=data, **kwargs)
+
+    def srequest(
+        self,
+        method: RequsetMethod,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        data: Optional[dict] = None,
+        **kwargs,
+    ) -> requests.Response:
+        if URL(url).path in self._PUBLIC_ENDPOINTS:
+            kwargs["auth"] = None
+        return super().srequest(method, url, params=params, data=data, **kwargs)
 
     async def stop_market_order(
         self,
@@ -169,25 +225,120 @@ class BinanceSpotAPI(BinanceSpotMixin, BinanceAPIBase):
         return params
 
 
-class BinanceUSDSMAPI(BinanceUSDSMMixin, BinanceAPIBase):
+class BinanceUSDSMAPIBase(BinanceAPIBase):
+    _ORDER_ENDPOINT = "/fapi/v1/order"
+    _FETCH_TICKER_ENDPOINT = "/fapi/v1/ticker/price"
+    _FETCH_ORDERBOOK_ENDPOINT = "/fapi/v1/depth"
+    _FETCH_ORDERS_ENDPOINT = "/fapi/v1/openOrders"
+    _FETCH_POSITIONS_ENDPOINT = "/fapi/v2/positionRisk"
+
+    def _make_fetch_orders_parameter(self, symbol: str) -> dict:
+        return {"symbol": symbol}
+
+    def _make_fetch_positions_parameter(self, symbol: str) -> dict:
+        return {"symbol": symbol}
+
+    def _make_fetch_orders_response(
+        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
+    ) -> FetchOrdersResponse:
+        orders = [
+            OrderItem(
+                id=str(i["orderId"]),
+                symbol=i["symbol"],
+                side=i["side"],
+                price=float(i["price"]),
+                size=float(i["origQty"]) - float(i["executedQty"]),
+                type=i["type"],
+                info=i,  # noqa
+            )
+            for i in resp_data
+        ]
+        return FetchOrdersResponse(orders, resp, resp_data)
+
+    def _make_fetch_positions_response(
+        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
+    ) -> "FetchPositionsResponse":
+        positions = [
+            PositionItem(
+                symbol=i["symbol"],
+                side=("BUY" if float(i["positionAmt"]) > 0 else "SELL"),
+                price=float(i["entryPrice"]),
+                size=float(i["positionAmt"]),
+                info=i,  # noqa
+            )
+            for i in resp_data
+        ]
+        return FetchPositionsResponse(positions, resp, resp_data)
+
+
+class BinanceUSDSMAPI(BinanceUSDSMMixin, BinanceUSDSMAPIBase):
     BASE_URL = "https://fapi.binance.com"
-    _ORDER_ENDPOINT = "/fapi/v1/order"
-    _FETCH_ORDERS_ENDPOINT = "/fapi/v1/openOrders"
 
 
-class BinanceUSDSMTESTAPI(BinanceUSDSMTESTMixin, BinanceAPIBase):
+class BinanceUSDSMTESTAPI(BinanceUSDSMTESTMixin, BinanceUSDSMAPI):
     BASE_URL = "https://testnet.binancefuture.com"
-    _ORDER_ENDPOINT = "/fapi/v1/order"
-    _FETCH_ORDERS_ENDPOINT = "/fapi/v1/openOrders"
 
 
-class BinanceCOINMAPI(BinanceCOINMMixin, BinanceAPIBase):
+class BinanceCOINMAPIBase(BinanceAPIBase):
+    _ORDER_ENDPOINT = "/dapi/v1/order"
+    _FETCH_TICKER_ENDPOINT = "/dapi/v1/ticker/price"
+    _FETCH_ORDERBOOK_ENDPOINT = "/dapi/v1/depth"
+    _FETCH_ORDERS_ENDPOINT = "/dapi/v1/openOrders"
+    _FETCH_POSITIONS_ENDPOINT = "/dapi/v1/positionRisk"
+
+    def _make_fetch_orders_parameter(self, symbol: str) -> dict:
+        return {"symbol": symbol}
+
+    def _make_fetch_positions_parameter(self, symbol: str) -> dict:
+        # coinmはsymbol（e.g., BNBUSD_PERP）の指定ができないので、パラメーターにこっそり忍ばせておく。
+        # 一応これでも認証は通ったが、通らなくなった場合どうするかは別途考える。
+        return {"pair": symbol.split("_")[0], "__symbol": symbol}
+
+    def _make_fetch_ticker_response(
+        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
+    ) -> FetchTickerResponse:
+        # なぜかcoinmだけsymbol指定してもlistで返ってくる
+        return super()._make_fetch_ticker_response(resp, resp_data[0])
+
+    def _make_fetch_orders_response(
+        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
+    ) -> FetchOrdersResponse:
+        orders = [
+            OrderItem(
+                id=str(i["orderId"]),
+                symbol=i["symbol"],
+                side=i["side"],
+                price=float(i["price"]),
+                size=float(i["origQty"]) - float(i["executedQty"]),
+                type=i["type"],
+                info=i,  # noqa
+            )
+            for i in resp_data
+        ]
+        return FetchOrdersResponse(orders, resp, resp_data)
+
+    def _make_fetch_positions_response(
+        self, resp: aiohttp.ClientResponse, resp_data: list[dict]
+    ) -> "FetchPositionsResponse":
+        # 忍ばせておいたsymbolを使って取得したいsymbolのポジション情報に絞る。
+        symbol = resp.request_info.url.query["__symbol"]
+        positions = [
+            PositionItem(
+                symbol=i["symbol"],
+                side=("BUY" if float(i["positionAmt"]) > 0 else "SELL"),
+                price=float(i["entryPrice"]),
+                size=float(i["positionAmt"]),
+                info=i,  # noqa
+            )
+            for i in resp_data
+            if i["symbol"] == symbol
+        ]
+        return FetchPositionsResponse(positions, resp, resp_data)
+
+
+class BinanceCOINMAPI(BinanceCOINMMixin, BinanceCOINMAPIBase):
     BASE_URL = "https://dapi.binance.com"
-    _ORDER_ENDPOINT = "/dapi/v1/order"
-    _FETCH_ORDERS_ENDPOINT = "/dapi/v1/openOrders"
 
 
-class BinanceCOINMTESTAPI(BinanceCOINMTESTMixin, BinanceAPIBase):
+class BinanceCOINMTESTAPI(BinanceCOINMTESTMixin, BinanceCOINMAPIBase):
     BASE_URL = "https://testnet.binancefuture.com"
-    _ORDER_ENDPOINT = "/dapi/v1/order"
-    _FETCH_ORDERS_ENDPOINT = "/dapi/v1/openOrders"
