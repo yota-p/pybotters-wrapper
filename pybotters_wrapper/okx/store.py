@@ -25,7 +25,7 @@ class OKXTradesStore(TradesStore):
             data["instId"],
             data["side"].upper(),
             float(data["px"]),
-            float(data["sz"]),
+            float(data["sz"]) / 100,
             pd.to_datetime(data["ts"], unit="ms", utc=True),
         )
 
@@ -36,7 +36,7 @@ class OKXOrderbookStore(OrderbookStore):
             data["instId"],
             "SELL" if data["side"] == "asks" else "BUY",
             float(data["px"]),
-            float(data["sz"])
+            float(data["sz"]) / 100
         )
 
 
